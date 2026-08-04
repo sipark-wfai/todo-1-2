@@ -16,9 +16,12 @@
 		"db:studio": "drizzle-kit studio --config=src/lib/server/db/drizzle.config.ts",
 		"db:seed": "node scripts/seed.js",
 		"db:backup": "node scripts/backup.js",
-		"start": "HOST=127.0.0.1 node build"
+		"start": "HOST=127.0.0.1 node --env-file-if-exists=.env build",
+		"test:unit": "vitest run",
+		"test:e2e": "playwright test"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.62.1",
 		"@sveltejs/adapter-node": "^5.5.7",
 		"@sveltejs/kit": "^2.63.0",
 		"@sveltejs/vite-plugin-svelte": "^7.1.2",
@@ -28,7 +31,8 @@
 		"svelte": "^5.56.1",
 		"svelte-check": "^4.6.0",
 		"typescript": "^6.0.3",
-		"vite": "^8.0.16"
+		"vite": "^8.0.16",
+		"vitest": "^4.1.10"
 	},
 	"dependencies": {
 		"better-sqlite3": "^13.0.2",

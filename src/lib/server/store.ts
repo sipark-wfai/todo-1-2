@@ -92,7 +92,11 @@ function statusCondition(status: TaskQuery['status']) {
 	return undefined;
 }
 
-function orderBy(sort: TaskQuery['sort']) {
+/**
+ * 정렬 절. 테스트가 실제 정렬 SQL을 EXPLAIN해 인덱스 사용을 검증하므로 export한다
+ * (NFR-104). 이 함수를 감추면 테스트가 하드코딩한 SQL을 검사하게 되어 회귀를 놓친다.
+ */
+export function orderBy(sort: TaskQuery['sort']) {
 	// 마감일 없음은 항상 뒤로 (FR-502).
 	// `due_date is null`을 정렬 선두에 두는 대신 NULLS LAST를 쓴다. 전자는 표현식이라
 	// 인덱스를 못 쓰고 TEMP B-TREE를 유발한다.

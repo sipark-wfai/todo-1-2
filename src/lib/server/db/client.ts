@@ -1,6 +1,9 @@
 // SQLite 커넥션. 서버 전용이므로 $lib/server 아래에 둔다 (PRD NFR-501).
 
-import { DB_URL } from '$env/static/private';
+// $env/dynamic/private를 쓴다. $env/static/private는 빌드 시점에 값을 인라인하므로
+// 빌드된 산출물이 런타임 DB_URL을 무시한다 — 그러면 운영자가 다시 빌드하지 않고는
+// DB 경로를 바꿀 수 없어 FR-602를 만족하지 못한다.
+import { env } from '$env/dynamic/private';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { mkdirSync } from 'node:fs';
@@ -12,7 +15,11 @@ export function resolveDbPath(url: string): string {
 	return url.replace(/^file:/, '');
 }
 
-const path = resolveDbPath(DB_URL);
+if (!env.DB_URL) {
+	throw new Error('DB_URL이 설정되지 않았습니다. .env를 확인하세요 (예: DB_URL=file:./data/todo.db).');
+}
+
+const path = resolveDbPath(env.DB_URL);
 mkdirSync(dirname(path), { recursive: true });
 
 const sqlite = new Database(path);
