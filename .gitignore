@@ -25,3 +25,7 @@ vite.config.ts.timestamp-*
 # 에디터 로컬 설정
 .obsidian/
 .claude/settings.local.json
+
+# SQLite 데이터 파일 (디렉터리는 유지 — drizzle-kit이 만들어주지 않는다)
+/data/*
+!/data/.gitkeep

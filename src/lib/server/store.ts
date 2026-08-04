@@ -1,13 +1,14 @@
-// 와이어프레임용 인메모리 목 데이터 스토어.
+// 데이터 접근 계층. SQLite + Drizzle로 구현한다.
 //
-// 이 모듈이 나중에 Drizzle + SQLite 쿼리로 교체되는 유일한 지점이다.
-// 화면(+page.svelte)과 로드/액션(+page.server.ts)은 아래 함수 시그니처만 알고 있으므로
-// DB 도입 시 이 파일만 다시 쓰면 된다. (docs/ERD.md §5 참고)
+// 화면(+page.svelte)과 로드/액션(+page.server.ts)은 이 모듈의 함수 시그니처만 알고 있다.
+// 와이어프레임 단계의 인메모리 목 데이터를 여기서만 교체했고 라우트는 손대지 않았다.
 //
-// 주의: 프로세스 메모리에만 존재한다. 서버를 재시작하면 시드 상태로 돌아간다.
-// 영속화는 PRD FR-601의 범위이며 이번 와이어프레임에는 포함되지 않는다.
+// better-sqlite3는 동기 API라 아래 함수들도 모두 동기다 (PRD §8 기술 결정).
+// 쓰기 트랜잭션은 짧게 유지한다 — SQLite는 단일 writer이므로 트랜잭션 길이가
+// 곧 쓰기 처리량 상한이다 (NFR-105).
 
-import { startOfDay, today } from '$lib/date';
+import { and, eq, gte, inArray, isNull, isNotNull, lt, lte, or, sql } from 'drizzle-orm';
+import { today } from '$lib/date';
 import {
 	DESCRIPTION_MAX,
 	TAG_NAME_MAX,
@@ -19,14 +20,19 @@ import {
 	type TaskQuery,
 	type TaskWithTags
 } from '$lib/types';
+import { db } from './db/client';
+import { tags, taskTags, tasks, type TagRow, type TaskRow } from './db/schema';
 
-let nextTaskId = 1;
-let nextTagId = 1;
+// ─── 행 → 도메인 타입 ────────────────────────────────────────────────────────
 
-const tags: Tag[] = [];
-const tasks: Task[] = [];
-/** ERD의 task_tags 조인 테이블에 대응 */
-const taskTags: { taskId: number; tagId: number }[] = [];
+function toTask(row: TaskRow): Task {
+	// priority는 DB에서 integer로 오지만 CHECK 제약이 1|2|3을 보장한다 (ERD §2.1)
+	return { ...row, priority: row.priority as Priority };
+}
+
+function toTag(row: TagRow): Tag {
+	return row;
+}
 
 function daysFromToday(offset: number): Date {
 	const d = today();
@@ -34,86 +40,97 @@ function daysFromToday(offset: number): Date {
 	return d;
 }
 
-function seed() {
-	const now = new Date();
-	const [work, urgent, personal, study] = ['업무', '긴급', '개인', '공부'].map((name) => {
-		const tag: Tag = { id: nextTagId++, name, createdAt: now };
-		tags.push(tag);
-		return tag;
-	});
-
-	const add = (
-		title: string,
-		priority: Priority,
-		dueOffset: number | null,
-		tagList: Tag[],
-		completedOffset: number | null = null
-	) => {
-		const task: Task = {
-			id: nextTaskId++,
-			title,
-			description: null,
-			completedAt: completedOffset === null ? null : daysFromToday(completedOffset),
-			dueDate: dueOffset === null ? null : daysFromToday(dueOffset),
-			priority,
-			createdAt: now,
-			updatedAt: now
-		};
-		tasks.push(task);
-		for (const tag of tagList) taskTags.push({ taskId: task.id, tagId: tag.id });
-	};
-
-	add('발표자료 초안 작성', 3, -3, [work, urgent]);
-	add('병원 예약 전화', 2, 0, [personal]);
-	add('주간 보고서 작성', 3, 1, [work]);
-	add('책 반납', 1, 5, []);
-	add('장바구니 정리', 2, null, [personal], -1);
-	add('스터디 자료 읽기', 1, -1, [study], -1);
+/** LIKE 패턴의 특수문자를 이스케이프한다. 검색어에 %나 _가 있어도 리터럴로 취급된다. */
+function escapeLike(keyword: string): string {
+	return keyword.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
-
-seed();
 
 // ─── 조회 ───────────────────────────────────────────────────────────────────
 
-function tagsOf(taskId: number): Tag[] {
-	return taskTags
-		.filter((link) => link.taskId === taskId)
-		.map((link) => tags.find((t) => t.id === link.tagId))
-		.filter((t): t is Tag => t !== undefined);
+/** 상태 필터를 제외한 조건. 요약 건수와 목록이 같은 조건을 공유한다. */
+function scopeConditions(query: TaskQuery) {
+	const conditions = [];
+
+	if (query.tagId !== null) {
+		conditions.push(
+			sql`exists (select 1 from ${taskTags} where ${taskTags.taskId} = ${tasks.id} and ${taskTags.tagId} = ${query.tagId})`
+		);
+	}
+
+	if (query.due !== 'all') {
+		const now = today();
+		if (query.due === 'today') {
+			conditions.push(eq(tasks.dueDate, now));
+		} else if (query.due === 'overdue') {
+			// 마감 지남은 미완료 항목에만 해당한다 (FR-202).
+			// Date 값은 반드시 Drizzle 연산자로 넘긴다 — raw sql 템플릿에 Date를 바인딩하면
+			// better-sqlite3가 거부한다 (숫자·문자열·bigint·buffer·null만 허용).
+			conditions.push(and(lt(tasks.dueDate, now), isNull(tasks.completedAt)));
+		} else {
+			// 이번 주 = 오늘부터 7일(오늘 포함)
+			conditions.push(and(gte(tasks.dueDate, now), lte(tasks.dueDate, daysFromToday(6))));
+		}
+	}
+
+	const keyword = query.q.trim().toLowerCase();
+	if (keyword) {
+		const pattern = `%${escapeLike(keyword)}%`;
+		conditions.push(
+			or(
+				sql`lower(${tasks.title}) like ${pattern} escape '\\'`,
+				sql`lower(${tasks.description}) like ${pattern} escape '\\'`
+			)
+		);
+	}
+
+	return conditions;
 }
 
-function withTags(task: Task): TaskWithTags {
-	return { ...task, tags: tagsOf(task.id) };
+function statusCondition(status: TaskQuery['status']) {
+	if (status === 'open') return isNull(tasks.completedAt);
+	if (status === 'done') return isNotNull(tasks.completedAt);
+	return undefined;
 }
 
-function matchesDue(task: Task, due: TaskQuery['due']): boolean {
-	if (due === 'all') return true;
-	if (!task.dueDate) return false;
-	const d = startOfDay(task.dueDate).getTime();
-	const now = today().getTime();
-	if (due === 'today') return d === now;
-	if (due === 'overdue') return d < now && task.completedAt === null;
-	// 이번 주 = 오늘부터 7일(오늘 포함)
-	return d >= now && d <= daysFromToday(6).getTime();
+function orderBy(sort: TaskQuery['sort']) {
+	// 마감일 없음은 항상 뒤로 (FR-502).
+	// `due_date is null`을 정렬 선두에 두는 대신 NULLS LAST를 쓴다. 전자는 표현식이라
+	// 인덱스를 못 쓰고 TEMP B-TREE를 유발한다.
+	const dueAsc = sql`${tasks.dueDate} asc nulls last`;
+	const priorityDesc = sql`${tasks.priority} desc`;
+
+	// id는 AUTOINCREMENT rowid라 id 역순 = 생성 역순이다.
+	// created_at으로 정렬하면 인덱스가 없어 정렬 비용이 붙지만, id 역순은 rowid 역방향
+	// 스캔이라 정렬이 아예 필요 없다.
+	if (sort === 'created') return [sql`${tasks.id} desc`];
+	if (sort === 'priority') return [priorityDesc, dueAsc];
+	return [dueAsc, priorityDesc];
 }
 
-function compare(a: Task, b: Task, sort: TaskQuery['sort']): number {
-	// 마감일 없음은 항상 뒤로 (PRD FR-502)
-	const byDue = () => {
-		const av = a.dueDate?.getTime() ?? Number.POSITIVE_INFINITY;
-		const bv = b.dueDate?.getTime() ?? Number.POSITIVE_INFINITY;
-		return av - bv;
-	};
-	const byPriority = () => b.priority - a.priority;
+/** 여러 할 일의 태그를 한 번의 쿼리로 가져온다 (N+1 방지) */
+function tagsByTaskId(taskIds: number[]): Map<number, Tag[]> {
+	const grouped = new Map<number, Tag[]>();
+	if (taskIds.length === 0) return grouped;
 
-	if (sort === 'created') return b.createdAt.getTime() - a.createdAt.getTime() || b.id - a.id;
-	if (sort === 'priority') return byPriority() || byDue();
-	return byDue() || byPriority();
+	const rows = db
+		.select({ taskId: taskTags.taskId, tag: tags })
+		.from(taskTags)
+		.innerJoin(tags, eq(tags.id, taskTags.tagId))
+		.where(inArray(taskTags.taskId, taskIds))
+		.orderBy(tags.name)
+		.all();
+
+	for (const row of rows) {
+		const list = grouped.get(row.taskId);
+		if (list) list.push(toTag(row.tag));
+		else grouped.set(row.taskId, [toTag(row.tag)]);
+	}
+	return grouped;
 }
 
 /**
- * 상태 필터를 제외한 조건으로 먼저 좁힌 뒤 미완료/완료 건수를 세고,
- * 그 다음 상태 필터를 적용한 목록을 반환한다.
+ * 상태 필터를 제외한 조건으로 미완료/완료 건수를 세고,
+ * 상태 필터까지 적용한 목록을 반환한다.
  * 요약 건수(화면설계서 SC-01 ⑪)가 상태 필터에 따라 0으로 사라지지 않게 하기 위함이다.
  */
 export function listTasks(query: TaskQuery): {
@@ -121,49 +138,75 @@ export function listTasks(query: TaskQuery): {
 	openCount: number;
 	doneCount: number;
 } {
-	const keyword = query.q.trim().toLowerCase();
+	const scope = scopeConditions(query);
+	const scopeWhere = scope.length > 0 ? and(...scope) : undefined;
 
-	const scoped = tasks.filter((task) => {
-		if (query.tagId !== null && !taskTags.some((l) => l.taskId === task.id && l.tagId === query.tagId))
-			return false;
-		if (!matchesDue(task, query.due)) return false;
-		if (keyword) {
-			const haystack = `${task.title} ${task.description ?? ''}`.toLowerCase();
-			if (!haystack.includes(keyword)) return false;
-		}
-		return true;
-	});
+	const counts = db
+		.select({
+			open: sql<number>`coalesce(sum(case when ${tasks.completedAt} is null then 1 else 0 end), 0)`,
+			done: sql<number>`coalesce(sum(case when ${tasks.completedAt} is not null then 1 else 0 end), 0)`
+		})
+		.from(tasks)
+		.where(scopeWhere)
+		.get();
 
-	const openCount = scoped.filter((t) => t.completedAt === null).length;
-	const doneCount = scoped.length - openCount;
+	const status = statusCondition(query.status);
+	const rows = db
+		.select()
+		.from(tasks)
+		.where(status ? and(...scope, status) : scopeWhere)
+		.orderBy(...orderBy(query.sort))
+		.all();
 
-	const visible = scoped.filter((task) => {
-		if (query.status === 'open') return task.completedAt === null;
-		if (query.status === 'done') return task.completedAt !== null;
-		return true;
-	});
+	const tagMap = tagsByTaskId(rows.map((r) => r.id));
 
 	return {
-		tasks: [...visible].sort((a, b) => compare(a, b, query.sort)).map(withTags),
-		openCount,
-		doneCount
+		tasks: rows.map((row) => ({ ...toTask(row), tags: tagMap.get(row.id) ?? [] })),
+		openCount: counts?.open ?? 0,
+		doneCount: counts?.done ?? 0
 	};
 }
 
 export function getTask(id: number): TaskWithTags | null {
-	const task = tasks.find((t) => t.id === id);
-	return task ? withTags(task) : null;
+	const row = db.select().from(tasks).where(eq(tasks.id, id)).get();
+	if (!row) return null;
+	return { ...toTask(row), tags: tagsByTaskId([id]).get(id) ?? [] };
 }
 
 export function listTags(): Tag[] {
-	return [...tags].sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+	return db.select().from(tags).orderBy(tags.name).all().map(toTag);
 }
 
 export function listTagsWithCount(): TagWithCount[] {
-	return listTags().map((tag) => ({
-		...tag,
-		taskCount: taskTags.filter((l) => l.tagId === tag.id).length
-	}));
+	return db
+		.select({
+			id: tags.id,
+			name: tags.name,
+			createdAt: tags.createdAt,
+			taskCount: sql<number>`count(${taskTags.taskId})`
+		})
+		.from(tags)
+		.leftJoin(taskTags, eq(taskTags.tagId, tags.id))
+		.groupBy(tags.id)
+		.orderBy(tags.name)
+		.all();
+}
+
+export function getTag(id: number): TagWithCount | null {
+	return (
+		db
+			.select({
+				id: tags.id,
+				name: tags.name,
+				createdAt: tags.createdAt,
+				taskCount: sql<number>`count(${taskTags.taskId})`
+			})
+			.from(tags)
+			.leftJoin(taskTags, eq(taskTags.tagId, tags.id))
+			.where(eq(tags.id, id))
+			.groupBy(tags.id)
+			.get() ?? null
+	);
 }
 
 // ─── 검증 ───────────────────────────────────────────────────────────────────
@@ -186,9 +229,14 @@ export function validateTagName(name: string): string | null {
 	const trimmed = name.trim();
 	if (!trimmed) return '태그 이름을 입력하세요.';
 	if (trimmed.length > TAG_NAME_MAX) return `태그 이름은 ${TAG_NAME_MAX}자까지 입력할 수 있습니다.`;
-	// 대소문자 무시 중복 검사. DB에서는 UNIQUE COLLATE NOCASE가 보장한다 (ERD §2.2)
-	if (tags.some((t) => t.name.toLowerCase() === trimmed.toLowerCase()))
-		return '이미 있는 태그입니다.';
+
+	// 대소문자 무시 중복 검사. DB의 lower(name) UNIQUE 인덱스가 최종 보장을 한다 (ERD §2.2)
+	const existing = db
+		.select({ id: tags.id })
+		.from(tags)
+		.where(sql`lower(${tags.name}) = ${trimmed.toLowerCase()}`)
+		.get();
+	if (existing) return '이미 있는 태그입니다.';
 	return null;
 }
 
@@ -196,18 +244,12 @@ export function validateTagName(name: string): string | null {
 
 export function createTask(title: string): Task {
 	const now = new Date();
-	const task: Task = {
-		id: nextTaskId++,
-		title: title.trim(),
-		description: null,
-		completedAt: null,
-		dueDate: null,
-		priority: 2,
-		createdAt: now,
-		updatedAt: now
-	};
-	tasks.push(task);
-	return task;
+	const row = db
+		.insert(tasks)
+		.values({ title: title.trim(), createdAt: now, updatedAt: now })
+		.returning()
+		.get();
+	return toTask(row);
 }
 
 export function updateTask(
@@ -221,65 +263,73 @@ export function updateTask(
 		tagIds: number[];
 	}
 ): boolean {
-	const task = tasks.find((t) => t.id === id);
-	if (!task) return false;
+	return db.transaction((tx) => {
+		const current = tx.select().from(tasks).where(eq(tasks.id, id)).get();
+		if (!current) return false;
 
-	task.title = fields.title.trim();
-	task.description = fields.description?.trim() || null;
-	task.dueDate = fields.dueDate;
-	task.priority = fields.priority;
-	// 이미 완료된 항목의 완료 시각은 보존한다
-	task.completedAt = fields.completed ? (task.completedAt ?? new Date()) : null;
-	task.updatedAt = new Date();
+		tx.update(tasks)
+			.set({
+				title: fields.title.trim(),
+				description: fields.description?.trim() || null,
+				dueDate: fields.dueDate,
+				priority: fields.priority,
+				// 이미 완료된 항목의 완료 시각은 보존한다
+				completedAt: fields.completed ? (current.completedAt ?? new Date()) : null,
+				updatedAt: new Date()
+			})
+			.where(eq(tasks.id, id))
+			.run();
 
-	// 태그 연결 갱신 (task_tags 재작성)
-	for (let i = taskTags.length - 1; i >= 0; i--) {
-		if (taskTags[i].taskId === id) taskTags.splice(i, 1);
-	}
-	for (const tagId of fields.tagIds) {
-		if (tags.some((t) => t.id === tagId)) taskTags.push({ taskId: id, tagId });
-	}
-	return true;
+		// 태그 연결 재작성
+		tx.delete(taskTags).where(eq(taskTags.taskId, id)).run();
+		if (fields.tagIds.length > 0) {
+			// 존재하지 않는 태그 id는 걸러낸다. FK 위반으로 트랜잭션이 깨지는 것을 막는다.
+			const valid = tx
+				.select({ id: tags.id })
+				.from(tags)
+				.where(inArray(tags.id, fields.tagIds))
+				.all();
+			if (valid.length > 0) {
+				tx.insert(taskTags)
+					.values(valid.map((tag) => ({ taskId: id, tagId: tag.id })))
+					.run();
+			}
+		}
+		return true;
+	});
 }
 
 export function toggleTask(id: number): boolean {
-	const task = tasks.find((t) => t.id === id);
-	if (!task) return false;
-	task.completedAt = task.completedAt ? null : new Date();
-	task.updatedAt = new Date();
-	return true;
+	return db.transaction((tx) => {
+		const current = tx
+			.select({ completedAt: tasks.completedAt })
+			.from(tasks)
+			.where(eq(tasks.id, id))
+			.get();
+		if (!current) return false;
+
+		tx.update(tasks)
+			.set({ completedAt: current.completedAt ? null : new Date(), updatedAt: new Date() })
+			.where(eq(tasks.id, id))
+			.run();
+		return true;
+	});
 }
 
-/** 할 일 삭제 시 태그 연결도 함께 제거된다 (PRD FR-109 = ERD의 ON DELETE CASCADE) */
+/** 할 일 삭제 시 태그 연결도 함께 제거된다 (FR-109 = ON DELETE CASCADE) */
 export function deleteTask(id: number): boolean {
-	const index = tasks.findIndex((t) => t.id === id);
-	if (index === -1) return false;
-	tasks.splice(index, 1);
-	for (let i = taskTags.length - 1; i >= 0; i--) {
-		if (taskTags[i].taskId === id) taskTags.splice(i, 1);
-	}
-	return true;
+	const deleted = db.delete(tasks).where(eq(tasks.id, id)).returning({ id: tasks.id }).all();
+	return deleted.length > 0;
 }
 
 export function createTag(name: string): Tag {
-	const tag: Tag = { id: nextTagId++, name: name.trim(), createdAt: new Date() };
-	tags.push(tag);
-	return tag;
+	return toTag(
+		db.insert(tags).values({ name: name.trim(), createdAt: new Date() }).returning().get()
+	);
 }
 
-/** 태그 삭제 시 연결만 제거하고 할 일은 유지한다 (PRD FR-404) */
+/** 태그 삭제 시 연결만 제거하고 할 일은 유지한다 (FR-404) */
 export function deleteTag(id: number): boolean {
-	const index = tags.findIndex((t) => t.id === id);
-	if (index === -1) return false;
-	tags.splice(index, 1);
-	for (let i = taskTags.length - 1; i >= 0; i--) {
-		if (taskTags[i].tagId === id) taskTags.splice(i, 1);
-	}
-	return true;
-}
-
-export function getTag(id: number): TagWithCount | null {
-	const tag = tags.find((t) => t.id === id);
-	if (!tag) return null;
-	return { ...tag, taskCount: taskTags.filter((l) => l.tagId === id).length };
+	const deleted = db.delete(tags).where(eq(tags.id, id)).returning({ id: tags.id }).all();
+	return deleted.length > 0;
 }

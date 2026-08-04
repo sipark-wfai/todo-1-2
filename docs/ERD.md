@@ -2,11 +2,19 @@
 
 | 항목 | 내용 |
 |---|---|
-| 문서 버전 | 1.0 |
-| 작성일 | 2026-08-04 |
+| 문서 버전 | 1.1 |
+| 작성일 · 최종 수정 | 2026-08-04 |
 | 대상 DB | SQLite (파일 기반) |
-| 접근 계층 | Drizzle ORM + better-sqlite3 |
+| 접근 계층 | Drizzle ORM 0.45 + better-sqlite3 13 |
+| 구현 경로 | `src/lib/server/db/` (스키마·커넥션·마이그레이션), `src/lib/server/store.ts` (쿼리) |
 | 관련 문서 | [PRD.md](PRD.md), [SCREENS.md](SCREENS.md) |
+
+**변경 이력**
+
+| 버전 | 일자 | 변경 내용 |
+|---|---|---|
+| 1.0 | 2026-08-04 | 최초 작성 |
+| 1.1 | 2026-08-04 | 구현 결과 반영: 인덱스 방향 지정(§2.1), COLLATE NOCASE → lower() 표현식 인덱스(§2.2), better-sqlite3 기본값 정정(§4), 백업 절차 신설(§7) |
 
 ---
 
@@ -71,19 +79,39 @@ erDiagram
 
 | 인덱스 | 컬럼 | 목적 |
 |---|---|---|
-| `idx_tasks_completed_at` | `completed_at` | 상태 필터 (FR-503) |
-| `idx_tasks_due_date` | `due_date` | 마감일 필터·정렬 (FR-502, FR-505) |
-| `idx_tasks_due_priority` | `due_date`, `priority DESC` | 기본 정렬 복합 인덱스 (FR-502, NFR-104) |
+| `idx_tasks_completed_at` | `completed_at` | 상태 필터 (FR-503), 요약 건수 집계의 커버링 인덱스 |
+| `idx_tasks_due_priority` | `due_date ASC`, `priority DESC` | 기본 정렬 (FR-502, NFR-104). 선두 컬럼으로 마감일 필터(FR-505)도 커버 |
+| `idx_tasks_priority_due` | `priority DESC`, `due_date ASC` | 우선순위 정렬 (FR-501) |
+
+**인덱스 방향이 중요하다.** `ORDER BY due_date ASC, priority DESC`는 인덱스 방향이 정확히 같아야
+인덱스 순서를 그대로 쓴다. 방향이 어긋나면 SQLite가 `USE TEMP B-TREE FOR ORDER BY`로 다시 정렬한다.
+1,000행 실측에서 방향을 맞춘 뒤 기본 정렬의 임시 정렬이 사라졌다.
+
+`due_date` 단일 인덱스는 두지 않는다. `idx_tasks_due_priority`의 선두 컬럼이 같은 역할을 하므로
+중복이고, 쓰기 때마다 갱신 비용만 늘어난다.
 
 ### 2.2 `tags` — 태그
 
 | 컬럼 | 타입 | 제약 | 기본값 | 설명 |
 |---|---|---|---|---|
 | `id` | INTEGER | PK, AUTOINCREMENT | — | 대리 키 |
-| `name` | TEXT | NOT NULL, UNIQUE **COLLATE NOCASE**, `length(trim(name)) BETWEEN 1 AND 30` | — | 태그 이름 (FR-402, FR-403) |
+| `name` | TEXT | NOT NULL, `length(trim(name)) BETWEEN 1 AND 30` | — | 태그 이름 (FR-402, FR-403) |
 | `created_at` | INTEGER | NOT NULL | 현재 시각 | 생성 시각 |
 
-> `COLLATE NOCASE` UNIQUE 제약이 "대소문자를 무시한 중복 거부"(FR-402)를 **DB 레벨에서** 보장한다. 애플리케이션 검사에만 의존하지 않는다.
+**인덱스**
+
+| 인덱스 | 대상 | 목적 |
+|---|---|---|
+| `idx_tags_name_nocase` | UNIQUE `lower(name)` | 대소문자 무시 중복 거부 (FR-402) |
+
+> "대소문자를 무시한 중복 거부"(FR-402)를 **DB 레벨에서** 보장한다. 애플리케이션 검사에만 의존하지 않는다.
+>
+> 컬럼에 `COLLATE NOCASE`를 붙이는 대신 `lower(name)` **표현식 유니크 인덱스**를 쓴다.
+> drizzle-kit이 `COLLATE NOCASE`를 생성해주지 않아 마이그레이션 SQL을 손으로 고쳐야 하는데,
+> 그러면 스키마 정의와 마이그레이션이 어긋나 다음 `generate`가 인덱스를 되돌린다.
+> 표현식 인덱스는 스키마에 선언 가능해서 이 드리프트가 없다.
+>
+> 실측: `INSERT 'ZZTest'` 후 `INSERT 'zztest'` → `UNIQUE constraint failed: index 'idx_tags_name_nocase'`.
 
 ### 2.3 `task_tags` — 할 일-태그 연결
 
@@ -140,13 +168,24 @@ erDiagram
 ```sql
 PRAGMA journal_mode = WAL;     -- 다중 읽기 + 단일 쓰기 동시성
 PRAGMA synchronous = NORMAL;   -- WAL과 조합 시 안전성/성능 균형
-PRAGMA foreign_keys = ON;      -- CASCADE 및 참조 무결성 활성 (기본값 OFF!)
+PRAGMA foreign_keys = ON;      -- CASCADE 및 참조 무결성 활성
 PRAGMA busy_timeout = 5000;    -- 쓰기 락 대기 5초, SQLITE_BUSY 회피
 ```
 
-**`foreign_keys = ON`은 SQLite에서 커넥션마다 기본 OFF다.** 이 설정을 빠뜨리면 `ON DELETE CASCADE`가 조용히 동작하지 않아 `task_tags`에 고아 행이 쌓인다 (NFR-202 위반).
-
 `journal_mode`는 DB 파일에 영구 기록되지만, 나머지 3개는 커넥션 단위 설정이라 매번 실행해야 한다.
+
+**드라이버 기본값 (실측):** better-sqlite3 13은 `foreign_keys=ON`, `synchronous=NORMAL(1)`,
+`busy_timeout=5000`을 **이미 기본으로 켠다.** 아무 PRAGMA도 설정하지 않은 커넥션과 위 4개를 모두
+설정한 커넥션의 조회 결과가 동일했다. 따라서 현재 드라이버에서 위 호출은 중복이다.
+
+그래도 명시적으로 실행한다:
+- 요구사항(NFR-201)이 코드에 드러난다
+- 드라이버를 libsql로 바꾸거나 기본값이 달라져도 동작이 변하지 않는다
+- **raw SQLite에서 `foreign_keys`는 커넥션마다 기본 OFF다.** 이 경우 `ON DELETE CASCADE`가
+  조용히 동작하지 않아 `task_tags`에 고아 행이 쌓인다 (NFR-202 위반)
+
+실측 검증: 할 일 삭제 시 `task_tags`가 6 → 4로 함께 줄고 고아 행 0건,
+`PRAGMA foreign_key_check` 결과도 빈 배열이었다.
 
 ---
 
@@ -161,9 +200,14 @@ PRAGMA busy_timeout = 5000;    -- 쓰기 락 대기 5초, SQLITE_BUSY 회피
 | `INTEGER` (시각) | `integer('created_at', { mode: 'timestamp' })` | Unix **초** 저장, JS `Date`로 변환 |
 | `INTEGER` (마감일) | `integer('due_date', { mode: 'timestamp' })` | 날짜 자정 값 (§3.3) |
 | CHECK 제약 | `sqliteTable(..., (t) => [check(...)])` | 앱 검증(FR-102)과 **이중 방어** |
-| UNIQUE NOCASE | `text('name').notNull().unique()` + 마이그레이션 SQL 수정 | drizzle-kit이 `COLLATE NOCASE`를 생성하지 않으면 생성된 SQL에 직접 추가 |
+| 대소문자 무시 UNIQUE | `uniqueIndex('...').on(sql\`lower(${t.name})\`)` | 표현식 인덱스. `COLLATE NOCASE`는 drizzle-kit이 생성하지 않는다 (§2.2) |
+| 인덱스 정렬 방향 | `index('...').on(sql\`${t.dueDate} asc\`, sql\`${t.priority} desc\`)` | Drizzle 0.45의 sqlite 인덱스 빌더에는 `.asc()/.desc()`가 **없다**. `sql`로 지정한다 |
 | 복합 PK | `primaryKey({ columns: [t.taskId, t.tagId] })` | |
 | FK CASCADE | `.references(() => tasks.id, { onDelete: 'cascade' })` | |
+
+**주의: raw `sql` 템플릿에 `Date`를 바인딩하면 안 된다.** better-sqlite3는 숫자·문자열·bigint·buffer·null만
+바인딩할 수 있다. `mode: 'timestamp'` 컬럼과 `Date`를 비교할 때는 반드시 Drizzle 연산자
+(`eq`, `lt`, `gte`, `lte`)를 써야 변환이 적용된다.
 
 타입은 스키마에서 파생한다 (NFR-602): `typeof tasks.$inferSelect`, `typeof tasks.$inferInsert`. 별도 인터페이스를 수동 정의하지 않는다.
 
@@ -179,21 +223,53 @@ PRAGMA busy_timeout = 5000;    -- 쓰기 락 대기 5초, SQLITE_BUSY 회피
 | `db:migrate` | 마이그레이션 파일 적용 | ✅ 필수 |
 | `db:push` | 파일 없이 DB 직접 변형 | ❌ **로컬 탐색용 한정** |
 | `db:studio` | DB 브라우저 | 개발 편의 |
+| `db:seed` | 데모 데이터 삽입 (할 일이 이미 있으면 건너뜀) | 개발 편의 |
+| `db:backup` | 백업 파일 생성 (§7) | ✅ |
 
 - 마이그레이션 파일은 저장소에 커밋한다 (FR-603, US-602).
 - `drizzle.config.ts`는 SvelteKit 런타임 밖에서 실행되므로 `$env/static/private`가 아니라 `process.env`를 읽는다.
 - DB 파일 경로는 `.env`의 `DB_URL`로 주입한다 (FR-602). DB 파일과 `.env`는 `.gitignore`에 넣는다 (NFR-505).
+- **`drizzle-kit`은 DB 파일의 상위 디렉터리를 만들어주지 않는다.** 없으면
+  `Cannot open database because the directory does not exist`로 실패한다. 클린 클론에서
+  `db:migrate`가 바로 되도록 `data/.gitkeep`을 커밋해 디렉터리를 유지한다 (NFR-604, AC-7).
+  앱 런타임에서는 `client.ts`가 `mkdirSync`로 직접 만든다.
+- 시드·백업 스크립트는 SvelteKit 런타임 밖에서 돌기 때문에 `$env/static/private`를 쓸 수 없어
+  `dotenv` + `process.env`로 `DB_URL`을 읽는다.
 
 ---
 
-## 7. 다중 사용자 전환 시 변경 (향후 F-1)
+## 7. 백업 · 복원 (FT-603, NFR-204)
+
+**`todo.db` 파일만 복사하면 안 된다.** WAL 모드에서는 최근 커밋이 `-wal` 파일에만 있을 수 있다.
+
+실측: 커넥션이 열려 WAL이 살아있는 상태에서 1건을 커밋한 뒤
+- `todo.db`만 복사한 백업 → **7건** (마지막 커밋 유실)
+- `todo.db` + `-wal` + `-shm`을 함께 복사한 백업 → 8건
+- `VACUUM INTO`로 만든 백업 → 8건
+
+**권장 절차** (`npm run db:backup`):
+
+```sql
+VACUUM INTO '/경로/todo-<타임스탬프>.db';
+```
+
+- WAL 내용까지 반영한 **단일 파일**을 만들고 조각화도 정리한다
+- 앱을 멈추지 않아도 안전하다
+- 대상 파일이 이미 있으면 실패한다 — 덮어쓰기 사고를 막아준다
+
+**복원**: 백업 파일을 `DB_URL` 경로로 복사한다. 이때 기존 `-wal`·`-shm` 파일은 함께 삭제해야
+낡은 WAL이 복원한 DB에 다시 적용되지 않는다.
+
+---
+
+## 8. 다중 사용자 전환 시 변경 (향후 F-1)
 
 지금 구현하지 않되, 전환 비용을 미리 기록한다.
 
 1. `users`, `sessions` 테이블 추가 (Better Auth 스키마 기준)
 2. `tasks.user_id`, `tags.user_id` FK 추가 (NOT NULL)
 3. 기존 행에 소유자를 채우는 데이터 마이그레이션 필요
-4. `tags.name` UNIQUE → `UNIQUE(user_id, name COLLATE NOCASE)` 복합 제약으로 변경
+4. `idx_tags_name_nocase`를 `UNIQUE(user_id, lower(name))` 복합 인덱스로 변경
 5. **모든 조회·수정 쿼리에 소유자 조건 추가** — 누락 시 데이터 유출. 가장 위험한 변경
 6. 인덱스에 `user_id` 선행 컬럼 추가
 
@@ -201,7 +277,7 @@ PRAGMA busy_timeout = 5000;    -- 쓰기 락 대기 5초, SQLITE_BUSY 회피
 
 ---
 
-## 8. 참고 자료
+## 9. 참고 자료
 
 - [Drizzle ORM — SQLite](https://orm.drizzle.team/docs/sqlite/get-started-sqlite)
 - [SvelteKit with SQLite and Drizzle — Full Stack SvelteKit](https://fullstacksveltekit.com/blog/sveltekit-sqlite-drizzle)
